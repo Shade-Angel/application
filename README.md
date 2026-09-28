@@ -19,7 +19,7 @@ docker compose ps
 
 API и Swagger: http://localhost:8000/docs. Полная инструкция по функциям, демонстрационному сценарию и устранению проблем: [README_FULL.md](README_FULL.md).
 
-Обзор разделов панели: [docs/PROJECT_OVERVIEW.md](docs/PROJECT_OVERVIEW.md). Отчёт о соответствии кейсу организаторов: [docs/ORGANIZER_SUBMISSION.md](docs/ORGANIZER_SUBMISSION.md).
+Отчёт о соответствии кейсу организаторов: [docs/ORGANIZER_SUBMISSION.md](docs/ORGANIZER_SUBMISSION.md).
 
 Остановить приложение, сохранив данные:
 
