@@ -1,0 +1,90 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                  id="Definitions_ExecutorBalancer"
+                  targetNamespace="https://executor-balancer.local/bpmn">
+  <bpmn:collaboration id="Collaboration_OrderAssignment">
+    <bpmn:participant id="Participant_AIS" name="Внешняя АИС / эмулятор" processRef="Process_AIS" />
+    <bpmn:participant id="Participant_Balancer" name="Executor Balancer" processRef="Process_Balancer" />
+    <bpmn:messageFlow id="MessageFlow_Order" name="Webhook новой заявки" sourceRef="Task_AIS_SendOrder" targetRef="Task_API_Validate" />
+    <bpmn:messageFlow id="MessageFlow_Assignment" name="Запрос назначения" sourceRef="Task_Dispatch_Assignment" targetRef="Task_AIS_StoreAssignment" />
+    <bpmn:messageFlow id="MessageFlow_Confirm" name="Webhook подтверждения" sourceRef="Task_AIS_SendConfirmation" targetRef="Task_API_ApplyConfirmation" />
+  </bpmn:collaboration>
+
+  <bpmn:process id="Process_AIS" name="Внешняя АИС" isExecutable="false">
+    <bpmn:startEvent id="StartEvent_AIS_Order" name="Поступила заявка" />
+    <bpmn:task id="Task_AIS_SendOrder" name="Отправить webhook заявки" />
+    <bpmn:task id="Task_AIS_StoreAssignment" name="Сохранить назначение по idempotency key" />
+    <bpmn:intermediateCatchEvent id="Event_AIS_Wait" name="Ожидать 2–10 секунд">
+      <bpmn:messageEventDefinition id="MessageEventDefinition_AssignmentResult" />
+    </bpmn:intermediateCatchEvent>
+    <bpmn:task id="Task_AIS_SendConfirmation" name="Отправить webhook подтверждения" />
+    <bpmn:endEvent id="EndEvent_AIS_Confirmed" name="Результат зафиксирован в АИС" />
+    <bpmn:sequenceFlow id="Flow_AIS_1" sourceRef="StartEvent_AIS_Order" targetRef="Task_AIS_SendOrder" />
+    <bpmn:sequenceFlow id="Flow_AIS_2" sourceRef="Task_AIS_StoreAssignment" targetRef="Event_AIS_Wait" />
+    <bpmn:sequenceFlow id="Flow_AIS_3" sourceRef="Event_AIS_Wait" targetRef="Task_AIS_SendConfirmation" />
+    <bpmn:sequenceFlow id="Flow_AIS_4" sourceRef="Task_AIS_SendConfirmation" targetRef="EndEvent_AIS_Confirmed" />
+  </bpmn:process>
+
+  <bpmn:process id="Process_Balancer" name="Приём и распределение заявки" isExecutable="false">
+    <bpmn:laneSet id="LaneSet_Balancer">
+      <bpmn:lane id="Lane_API" name="Balancer API">
+        <bpmn:flowNodeRef>StartEvent_Balancer_Order</bpmn:flowNodeRef>
+        <bpmn:flowNodeRef>Task_API_Validate</bpmn:flowNodeRef>
+        <bpmn:flowNodeRef>Gateway_Duplicate</bpmn:flowNodeRef>
+        <bpmn:flowNodeRef>EndEvent_Duplicate</bpmn:flowNodeRef>
+        <bpmn:flowNodeRef>Task_API_ApplyConfirmation</bpmn:flowNodeRef>
+        <bpmn:flowNodeRef>EndEvent_Confirmed</bpmn:flowNodeRef>
+      </bpmn:lane>
+      <bpmn:lane id="Lane_Storage" name="PostgreSQL и outbox">
+        <bpmn:flowNodeRef>Task_DB_SaveOrder</bpmn:flowNodeRef>
+        <bpmn:flowNodeRef>Task_DB_MarkUnassignable</bpmn:flowNodeRef>
+        <bpmn:flowNodeRef>EndEvent_WaitForChange</bpmn:flowNodeRef>
+        <bpmn:flowNodeRef>Task_DB_ReserveAndOutbox</bpmn:flowNodeRef>
+        <bpmn:flowNodeRef>Task_DB_ApplyConfirmation</bpmn:flowNodeRef>
+      </bpmn:lane>
+      <bpmn:lane id="Lane_Async" name="Stream и matching workers">
+        <bpmn:flowNodeRef>Task_Stream_Publish</bpmn:flowNodeRef>
+        <bpmn:flowNodeRef>Task_Worker_Match</bpmn:flowNodeRef>
+        <bpmn:flowNodeRef>Gateway_Candidate</bpmn:flowNodeRef>
+      </bpmn:lane>
+      <bpmn:lane id="Lane_Dispatch" name="Dispatcher">
+        <bpmn:flowNodeRef>Task_Dispatch_Assignment</bpmn:flowNodeRef>
+      </bpmn:lane>
+    </bpmn:laneSet>
+
+    <bpmn:startEvent id="StartEvent_Balancer_Order" name="Webhook заявки получен" />
+    <bpmn:task id="Task_API_Validate" name="Проверить secret, схему и event id" />
+    <bpmn:exclusiveGateway id="Gateway_Duplicate" name="Событие уже обработано?" default="Flow_NewEvent" />
+    <bpmn:endEvent id="EndEvent_Duplicate" name="Ответить без повторного распределения" />
+    <bpmn:task id="Task_DB_SaveOrder" name="В одной транзакции сохранить заявку и stream outbox" />
+    <bpmn:task id="Task_Stream_Publish" name="Опубликовать событие в Redis Stream" />
+    <bpmn:task id="Task_Worker_Match" name="Заблокировать кандидатов; проверить DSL и лимиты; рассчитать score" />
+    <bpmn:exclusiveGateway id="Gateway_Candidate" name="Есть подходящий исполнитель?" default="Flow_NoCandidate" />
+    <bpmn:task id="Task_DB_MarkUnassignable" name="Записать unassignable и причины отказа" />
+    <bpmn:endEvent id="EndEvent_WaitForChange" name="Ожидать изменения данных или правила" />
+    <bpmn:task id="Task_DB_ReserveAndOutbox" name="Атомарно зарезервировать слот и записать AIS outbox и аудит" />
+    <bpmn:task id="Task_Dispatch_Assignment" name="Повторно отправлять назначение с idempotency key; DLQ после лимита" />
+    <bpmn:task id="Task_API_ApplyConfirmation" name="Проверить webhook подтверждения" />
+    <bpmn:task id="Task_DB_ApplyConfirmation" name="Зафиксировать подтверждение, latency и состояние слота" />
+    <bpmn:endEvent id="EndEvent_Confirmed" name="Назначение подтверждено" />
+
+    <bpmn:sequenceFlow id="Flow_StartValidate" sourceRef="StartEvent_Balancer_Order" targetRef="Task_API_Validate" />
+    <bpmn:sequenceFlow id="Flow_ValidateDuplicate" sourceRef="Task_API_Validate" targetRef="Gateway_Duplicate" />
+    <bpmn:sequenceFlow id="Flow_Duplicate" name="Да" sourceRef="Gateway_Duplicate" targetRef="EndEvent_Duplicate">
+      <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">event_id уже записан</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="Flow_NewEvent" name="Нет" sourceRef="Gateway_Duplicate" targetRef="Task_DB_SaveOrder" />
+    <bpmn:sequenceFlow id="Flow_SavePublish" sourceRef="Task_DB_SaveOrder" targetRef="Task_Stream_Publish" />
+    <bpmn:sequenceFlow id="Flow_PublishMatch" sourceRef="Task_Stream_Publish" targetRef="Task_Worker_Match" />
+    <bpmn:sequenceFlow id="Flow_MatchCandidate" sourceRef="Task_Worker_Match" targetRef="Gateway_Candidate" />
+    <bpmn:sequenceFlow id="Flow_NoCandidate" name="Нет" sourceRef="Gateway_Candidate" targetRef="Task_DB_MarkUnassignable" />
+    <bpmn:sequenceFlow id="Flow_Wait" sourceRef="Task_DB_MarkUnassignable" targetRef="EndEvent_WaitForChange" />
+    <bpmn:sequenceFlow id="Flow_HasCandidate" name="Да" sourceRef="Gateway_Candidate" targetRef="Task_DB_ReserveAndOutbox">
+      <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">есть активный кандидат; фильтры и дневной лимит пройдены</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="Flow_ReserveDispatch" sourceRef="Task_DB_ReserveAndOutbox" targetRef="Task_Dispatch_Assignment" />
+    <bpmn:sequenceFlow id="Flow_ConfirmDB" sourceRef="Task_API_ApplyConfirmation" targetRef="Task_DB_ApplyConfirmation" />
+    <bpmn:sequenceFlow id="Flow_ConfirmEnd" sourceRef="Task_DB_ApplyConfirmation" targetRef="EndEvent_Confirmed" />
+  </bpmn:process>
+</bpmn:definitions>

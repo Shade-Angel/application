@@ -1,0 +1,166 @@
+x-balancer-env: &balancer-env
+  REVIEW_STATUS: ${REVIEW_STATUS:-await}
+  OPEN_STATUSES: ${OPEN_STATUSES:-processed,await}
+  CLOSED_STATUSES: ${CLOSED_STATUSES:-accept,reject}
+  REASSIGN_ONLY_SECONDARY: ${REASSIGN_ONLY_SECONDARY:-true}
+  REASSIGN_ON_DEACTIVATE: ${REASSIGN_ON_DEACTIVATE:-false}
+  LIMIT_TZ: ${LIMIT_TZ:-Europe/Moscow}
+  CONFIRM_TIMEOUT: ${CONFIRM_TIMEOUT:-15}
+  MAX_ATTEMPTS: ${MAX_ATTEMPTS:-5}
+  API_KEY: ${API_KEY:-local-demo-key}
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-balancer}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-balancer}
+      POSTGRES_DB: ${POSTGRES_DB:-balancer}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./infra/postgres-init.sql:/docker-entrypoint-initdb.d/001-init.sql:ro
+    ports: ["5432:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+  migrate:
+    build: ./backend
+    command: uv run alembic upgrade head
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-balancer}:${POSTGRES_PASSWORD:-balancer}@postgres:5432/${POSTGRES_DB:-balancer}
+    depends_on:
+      postgres: {condition: service_healthy}
+  seed:
+    build: ./backend
+    command: uv run python -m app.seed
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://balancer:balancer@postgres:5432/balancer}
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+  sync:
+    build: ./backend
+    command: uv run python -m app.seed --sync
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://balancer:balancer@postgres:5432/balancer}
+      BALANCER_URL: ${BALANCER_URL:-http://api:8000}
+      WEBHOOK_SECRET: ${WEBHOOK_SECRET:-local-demo-secret}
+    depends_on:
+      api: {condition: service_healthy}
+      ais-emulator: {condition: service_healthy}
+      seed: {condition: service_completed_successfully}
+  api:
+    build: ./backend
+    command: uv run uvicorn app.main:app --host 0.0.0.0 --port 8000
+    environment:
+      <<: *balancer-env
+      DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://balancer:balancer@postgres:5432/balancer}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      AIS_URL: ${AIS_URL:-http://ais-emulator:8001}
+      WEBHOOK_SECRET: ${WEBHOOK_SECRET:-local-demo-secret}
+    ports: ["8000:8000"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 15s
+    depends_on:
+      redis: {condition: service_healthy}
+  worker:
+    build: ./backend
+    command: uv run python -m app.worker
+    deploy:
+      replicas: 2
+    environment:
+      <<: *balancer-env
+      DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://balancer:balancer@postgres:5432/balancer}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      AIS_URL: ${AIS_URL:-http://ais-emulator:8001}
+      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-16}
+    depends_on:
+      sync: {condition: service_completed_successfully}
+      redis: {condition: service_healthy}
+  stream-producer:
+    build: ./backend
+    command: uv run python -m app.stream_producer
+    environment:
+      <<: *balancer-env
+      DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://balancer:balancer@postgres:5432/balancer}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+    depends_on:
+      sync: {condition: service_completed_successfully}
+      redis: {condition: service_healthy}
+  dispatcher:
+    build: ./backend
+    command: uv run python -m app.dispatcher
+    environment:
+      <<: *balancer-env
+      DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://balancer:balancer@postgres:5432/balancer}
+      AIS_URL: ${AIS_URL:-http://ais-emulator:8001}
+    depends_on:
+      sync: {condition: service_completed_successfully}
+  ais-emulator:
+    build: ./backend
+    command: uv run uvicorn app.ais:app --host 0.0.0.0 --port 8001
+    environment:
+      <<: *balancer-env
+      DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://balancer:balancer@postgres:5432/balancer}
+      BALANCER_URL: ${BALANCER_URL:-http://api:8000}
+      WEBHOOK_SECRET: ${WEBHOOK_SECRET:-local-demo-secret}
+      PYTHONPATH: /app
+    ports: ["8001:8001"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health')"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 15s
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        VITE_API_KEY: ${API_KEY:-local-demo-key}
+    ports: ["5173:80"]
+    depends_on:
+      api: {condition: service_healthy}
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    profiles: [observability]
+    volumes: ["./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro"]
+    ports: ["9090:9090"]
+    depends_on: [api]
+  grafana:
+    image: grafana/grafana:12.1.0
+    profiles: [observability]
+    ports: ["3000:3000"]
+    volumes:
+      - ./observability/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/dashboard.json:/var/lib/grafana/dashboards/balancer.json:ro
+    depends_on: [prometheus]
+  locust:
+    build: ./backend
+    profiles: [load]
+    command: uv run locust -f /load/locustfile.py --headless --host http://ais-emulator:8001 --csv=/results/load-${LOAD_PROFILE:-A}
+    environment:
+      LOAD_PROFILE: ${LOAD_PROFILE:-A}
+      REQUEST_PACING_S: ${REQUEST_PACING_S:-0.9}
+      LOCUST_HOST: http://ais-emulator:8001
+    volumes:
+      - ./tests/load:/load:ro
+      - ./load-results:/results
+    depends_on:
+      sync: {condition: service_completed_successfully}
+      ais-emulator: {condition: service_healthy}
+volumes:
+  pgdata:
